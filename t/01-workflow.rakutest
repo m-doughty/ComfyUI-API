@@ -1,0 +1,95 @@
+use Test;
+use lib 'lib';
+use ComfyUI::API::Workflow;
+
+plan 11;
+
+my IO::Path $fixture = 't/fixtures/simple-workflow.json'.IO;
+
+subtest 'from-file loads workflow' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	ok $wf.defined, 'Workflow loaded';
+};
+
+subtest 'from-json parses JSON string' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-json($fixture.slurp);
+	ok $wf.defined, 'Workflow parsed';
+};
+
+subtest 'to-hash returns data' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	ok $wf.to-hash<7>:exists, 'KSampler node exists in hash';
+};
+
+subtest 'set changes a node field' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	$wf.set('7', 'seed', 999);
+	is $wf.to-hash<7><inputs><seed>, 999, 'Seed updated';
+};
+
+subtest 'set-by-title finds node and sets field' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	$wf.set-by-title('KSampler', 'steps', 50);
+	is $wf.to-hash<7><inputs><steps>, 50, 'Steps updated by title';
+};
+
+subtest 'set-by-title dies for unknown title' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	dies-ok { $wf.set-by-title('Nonexistent', 'x', 1) }, 'Dies for unknown title';
+};
+
+subtest 'find-nodes-by-class returns correct IDs' => {
+	plan 2;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	my @clip = $wf.find-nodes-by-class('CLIPTextEncode');
+	is @clip.elems, 2, 'Two CLIP nodes found';
+	is-deeply @clip.sort.List, ('4', '5'), 'Correct node IDs';
+};
+
+subtest 'render substitutes {{vars}} in all string values' => {
+	plan 3;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	my ComfyUI::API::Workflow $rendered = $wf.render(%(
+		positive_prompt => 'a portrait of a knight',
+		negative_prompt => 'blurry, low quality',
+		model_name      => 'ponyDiffusionV6XL.safetensors',
+		vae_name        => 'sdxl_vae.safetensors',
+	));
+	is $rendered.to-hash<4><inputs><text>, 'a portrait of a knight', 'Positive prompt rendered';
+	is $rendered.to-hash<5><inputs><text>, 'blurry, low quality', 'Negative prompt rendered';
+	is $rendered.to-hash<1><inputs><ckpt_name>, 'ponyDiffusionV6XL.safetensors', 'Model name rendered';
+};
+
+subtest 'render leaves non-string values untouched' => {
+	plan 2;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	my ComfyUI::API::Workflow $rendered = $wf.render(%(
+		positive_prompt => 'test',
+		negative_prompt => 'test',
+		model_name      => 'test.safetensors',
+		vae_name        => 'test_vae.safetensors',
+	));
+	is $rendered.to-hash<7><inputs><seed>, 42, 'Integer preserved';
+	is $rendered.to-hash<7><inputs><cfg>, 7, 'Numeric preserved';
+};
+
+subtest 'render dies on missing variable' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	dies-ok { $wf.render(%(:positive_prompt('test'))) },
+		'Dies when variables are missing';
+};
+
+subtest 'to-json round-trips' => {
+	plan 1;
+	my ComfyUI::API::Workflow $wf = ComfyUI::API::Workflow.from-file($fixture);
+	my Str:D $json = $wf.to-json;
+	my ComfyUI::API::Workflow $wf2 = ComfyUI::API::Workflow.from-json($json);
+	is $wf2.to-hash<7><inputs><seed>, 42, 'Round-trip preserves data';
+};

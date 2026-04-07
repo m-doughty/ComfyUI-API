@@ -1,0 +1,9 @@
+Revision history for ComfyUI::API
+
+{{$NEXT}}
+
+0.1.0  2026-04-07T23:30:55+01:00
+    - Initial release
+    - Workflow loading, templating with {{var}} substitution, node manipulation
+    - Client: submit workflows, poll for results, download images
+    - Result: parsed output with image access

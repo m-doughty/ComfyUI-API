@@ -1,0 +1,51 @@
+use Test;
+use lib 'lib';
+use ComfyUI::API::Result;
+
+plan 5;
+
+# Simulate a ComfyUI history response
+my %fixture-data = %(
+	outputs => %(
+		'9' => %(
+			images => [
+				%( filename => 'ComfyUI_00001_.png', subfolder => '', type => 'output' ),
+				%( filename => 'ComfyUI_00002_.png', subfolder => '', type => 'output' ),
+			],
+		),
+		'10' => %(
+			text => ['Some debug output'],
+		),
+	),
+);
+
+subtest 'images returns image list' => {
+	plan 1;
+	my ComfyUI::API::Result $r .= new(:prompt-id('test-123'), :data(%fixture-data));
+	is $r.images.elems, 2, 'Two images found';
+};
+
+subtest 'image-filenames returns filenames' => {
+	plan 1;
+	my ComfyUI::API::Result $r .= new(:prompt-id('test-123'), :data(%fixture-data));
+	is-deeply $r.image-filenames.List, ('ComfyUI_00001_.png', 'ComfyUI_00002_.png'),
+		'Filenames extracted';
+};
+
+subtest 'output-for-node returns node output' => {
+	plan 1;
+	my ComfyUI::API::Result $r .= new(:prompt-id('test-123'), :data(%fixture-data));
+	ok $r.output-for-node('9')<images>:exists, 'Node 9 has images';
+};
+
+subtest 'output-for-node unknown returns empty hash' => {
+	plan 1;
+	my ComfyUI::API::Result $r .= new(:prompt-id('test-123'), :data(%fixture-data));
+	is $r.output-for-node('999').elems, 0, 'Unknown node returns empty';
+};
+
+subtest 'prompt-id accessible' => {
+	plan 1;
+	my ComfyUI::API::Result $r .= new(:prompt-id('test-123'), :data(%fixture-data));
+	is $r.prompt-id, 'test-123', 'Prompt ID correct';
+};

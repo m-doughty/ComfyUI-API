@@ -1,0 +1,35 @@
+{
+  "auth": "zef:apogee",
+  "authors": [
+    "Matt Doughty"
+  ],
+  "build-depends": [
+  ],
+  "depends": [
+    "Cro::HTTP",
+    "JSON::Fast:auth<cpan:TIMOTIMO>",
+    "UUID::V4"
+  ],
+  "description": "Raku client for the ComfyUI image generation API with workflow templating",
+  "license": "Artistic-2.0",
+  "name": "ComfyUI::API",
+  "perl": "6.d",
+  "provides": {
+    "ComfyUI::API": "lib/ComfyUI/API.rakumod",
+    "ComfyUI::API::Client": "lib/ComfyUI/API/Client.rakumod",
+    "ComfyUI::API::Result": "lib/ComfyUI/API/Result.rakumod",
+    "ComfyUI::API::Workflow": "lib/ComfyUI/API/Workflow.rakumod"
+  },
+  "resources": [
+  ],
+  "source-url": "https://github.com/m-doughty/ComfyUI-API.git",
+  "tags": [
+    "comfyui",
+    "image-generation",
+    "api",
+    "workflow"
+  ],
+  "test-depends": [
+  ],
+  "version": "0.1.0"
+}

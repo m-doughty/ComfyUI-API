@@ -1,0 +1,116 @@
+[![Actions Status](https://github.com/m-doughty/ComfyUI-API/actions/workflows/test.yml/badge.svg)](https://github.com/m-doughty/ComfyUI-API/actions)
+
+NAME
+====
+
+ComfyUI::API - Raku client for the ComfyUI image generation API with workflow templating
+
+SYNOPSIS
+========
+
+```raku
+use ComfyUI::API;
+
+# Load and template a workflow
+my $wf = ComfyUI::API::Workflow.from-file('my-workflow.json'.IO);
+my $rendered = $wf.render(%(
+    positive_prompt => 'a portrait of a knight in shining armor',
+    negative_prompt => 'blurry, low quality',
+    model_name      => 'sd_xl_base_1.0.safetensors',
+));
+
+# Or modify nodes directly
+$wf.set('3', 'seed', 12345);
+$wf.set-by-title('KSampler', 'steps', 30);
+
+# Submit and wait for result
+my $client = ComfyUI::API::Client.new(:base-url('http://localhost:8188'));
+my $result = $client.submit-and-wait($rendered);
+
+# Download generated images
+for $result.image-filenames -> $filename {
+    my Buf $image = $client.download($filename);
+    "output/$filename".IO.spurt($image, :bin);
+}
+```
+
+DESCRIPTION
+===========
+
+ComfyUI::API provides a Raku client for ComfyUI's REST API. Load workflow JSONs, template them with open-ended `{{variable}}` substitution, submit to a ComfyUI server, and download generated images.
+
+ComfyUI::API::Workflow
+----------------------
+
+Load, template, and modify ComfyUI workflow JSONs.
+
+```raku
+# Load
+my $wf = ComfyUI::API::Workflow.from-file($path);
+my $wf = ComfyUI::API::Workflow.from-json($json-string);
+my $wf = ComfyUI::API::Workflow.from-hash(%data);
+
+# Template — replaces {{var}} in ALL string values throughout the workflow
+my $rendered = $wf.render(%(key => 'value', ...));
+
+# Direct node manipulation
+$wf.set('3', 'seed', 42);                           # By node ID
+$wf.set-by-title('KSampler', 'steps', 30);          # By node title
+my @ids = $wf.find-nodes-by-class('CLIPTextEncode'); # Find by class
+
+# Serialize
+$wf.to-json;   # JSON string
+$wf.to-hash;   # Raw Hash
+```
+
+ComfyUI::API::Client
+--------------------
+
+HTTP client for ComfyUI server. Blocking by default.
+
+```raku
+my $client = ComfyUI::API::Client.new(
+    :base-url('http://localhost:8188'),  # Default
+    :client-id('my-app'),               # Optional, auto-generated UUID
+);
+
+# Submit and poll
+my $prompt-id = $client.submit($workflow);
+my $result = $client.poll($prompt-id, :timeout(300e0), :interval(1e0));
+
+# Or one-step
+my $result = $client.submit-and-wait($workflow, :timeout(300e0));
+
+# Download images (use type 'temp' for PreviewImage, 'output' for SaveImage)
+my Buf $image = $client.download($filename, :type<temp>);
+
+# Server info
+my %queue = $client.queue-status;
+my %nodes = $client.node-info;
+```
+
+ComfyUI::API::Result
+--------------------
+
+Parsed result from a completed generation.
+
+```raku
+$result.prompt-id;                 # The prompt ID
+$result.images;                    # List of image info hashes
+$result.image-filenames;           # List of filename strings
+$result.output-for-node('9');      # Output for a specific node
+$result.raw;                       # Raw history data
+```
+
+AUTHOR
+======
+
+Matt Doughty <matt@apogee.guru>
+
+COPYRIGHT AND LICENSE
+=====================
+
+Copyright 2026 Matt Doughty
+
+This library is free software; you can redistribute it and/or modify it under the Artistic License 2.0.
+

@@ -1,0 +1,16 @@
+.precomp
+lib/.precomp
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.old
+*.log
+core
+*.core
+ComfyUI-API-*
