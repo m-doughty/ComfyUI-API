@@ -6,9 +6,9 @@
   "build-depends": [
   ],
   "depends": [
-    "Cro::HTTP",
-    "JSON::Fast:auth<cpan:TIMOTIMO>",
-    "UUID::V4"
+    "Cro::HTTP:ver<0.8.11>:auth<zef:cro>",
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
+    "UUID::V4:ver<1.0.0>:auth<zef:masukomi>"
   ],
   "description": "Raku client for the ComfyUI image generation API with workflow templating",
   "license": "Artistic-2.0",
@@ -31,5 +31,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
