@@ -1,0 +1,159 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use Cro::HTTP::Server;
+use Cro::HTTP::Router;
+use Cro::HTTP::Router::WebSocket;
+use Cro::WebSocket::Client;
+use ComfyUI::API::Client;
+
+plan 8;
+
+my ComfyUI::API::Client $client .= new;
+
+subtest 'parse-progress-message: status → queue event' => {
+	plan 3;
+	my %ev = $client.parse-progress-message(%(
+		type => 'status',
+		data => %( status => %( exec_info => %( queue_remaining => 3 ) ) ),
+	));
+	is %ev<type>,    'queue', 'type';
+	is %ev<pending>, 3,       'pending count';
+	is %ev<running>, 0,       'running count default';
+};
+
+subtest 'parse-progress-message: execution_start' => {
+	plan 2;
+	my %ev = $client.parse-progress-message(%(
+		type => 'execution_start',
+		data => %( prompt_id => 'abc123', timestamp => 1234567890 ),
+	));
+	is %ev<type>,      'execution-start';
+	is %ev<prompt-id>, 'abc123';
+};
+
+subtest 'parse-progress-message: executing with node → executing event' => {
+	plan 3;
+	my %ev = $client.parse-progress-message(%(
+		type => 'executing',
+		data => %( node => '7', prompt_id => 'abc123' ),
+	));
+	is %ev<type>,      'executing';
+	is %ev<node>,      '7';
+	is %ev<prompt-id>, 'abc123';
+};
+
+subtest 'parse-progress-message: executing with null node → execution-end (legacy)' => {
+	plan 2;
+	my %ev = $client.parse-progress-message(%(
+		type => 'executing',
+		data => %( node => Any, prompt_id => 'abc123' ),
+	));
+	is %ev<type>,      'execution-end';
+	is %ev<prompt-id>, 'abc123';
+};
+
+subtest 'parse-progress-message: progress' => {
+	plan 5;
+	my %ev = $client.parse-progress-message(%(
+		type => 'progress',
+		data => %(
+			value     => 12,
+			max       => 30,
+			prompt_id => 'abc123',
+			node      => '7',
+		),
+	));
+	is %ev<type>,      'progress';
+	is %ev<value>,     12;
+	is %ev<max>,       30;
+	is %ev<node>,      '7';
+	is %ev<prompt-id>, 'abc123';
+};
+
+subtest 'parse-progress-message: execution_success → execution-end' => {
+	plan 2;
+	my %ev = $client.parse-progress-message(%(
+		type => 'execution_success',
+		data => %( prompt_id => 'xyz', timestamp => 1234567890 ),
+	));
+	is %ev<type>,      'execution-end';
+	is %ev<prompt-id>, 'xyz';
+};
+
+subtest 'parse-progress-message: execution_error' => {
+	plan 4;
+	my %ev = $client.parse-progress-message(%(
+		type => 'execution_error',
+		data => %(
+			prompt_id         => 'broken-prompt',
+			node_id           => '7',
+			exception_message => 'CUDA out of memory',
+		),
+	));
+	is %ev<type>,      'error';
+	is %ev<prompt-id>, 'broken-prompt';
+	is %ev<node>,      '7';
+	is %ev<message>,   'CUDA out of memory';
+};
+
+subtest 'progress-supply emits typed events from a live WebSocket fixture' => {
+	plan 3;
+
+	# Spin up a tiny WS server that emulates ComfyUI's emission pattern.
+	my $port    = 30000 + (^5000).pick;
+	my $started = Promise.new;
+
+	my $app = route {
+		get -> 'ws' {
+			web-socket -> $incoming {
+				supply {
+					whenever Promise.in(0.1) {
+						emit to-json({
+							type => 'execution_start',
+							data => { prompt_id => 'fixture-prompt', timestamp => 0 },
+						});
+						emit to-json({
+							type => 'progress',
+							data => { value => 1, max => 10, prompt_id => 'fixture-prompt', node => '7' },
+						});
+						emit to-json({
+							type => 'execution_success',
+							data => { prompt_id => 'fixture-prompt', timestamp => 0 },
+						});
+					}
+					whenever $incoming -> $m {
+						# Drain incoming so the conn isn't blocked.
+					}
+				}
+			}
+		}
+	};
+
+	my $service = Cro::HTTP::Server.new(:host<127.0.0.1>, :$port, :application($app));
+	$service.start;
+	$started.keep;
+
+	LEAVE $service.stop;
+
+	my ComfyUI::API::Client $ws-client .= new(
+		base-url  => "http://127.0.0.1:$port",
+		client-id => 'test-client',
+	);
+
+	my @events;
+	my $done = Promise.new;
+	my $tap  = $ws-client.progress-supply.tap(-> %ev {
+		@events.push(%ev);
+		$done.keep if %ev<type> eq 'execution-end' && !$done.status ~~ Kept;
+	});
+
+	# Wait for the canned sequence (or a generous timeout).
+	await Promise.anyof($done, Promise.in(5));
+	$tap.close;
+
+	my @types = @events.map(*<type>);
+	ok 'execution-start' ∈ @types,  "Saw execution-start (got: {@types.join(', ')})";
+	ok 'progress'        ∈ @types,  'Saw progress';
+	ok 'execution-end'   ∈ @types,  'Saw execution-end';
+};

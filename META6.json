@@ -7,6 +7,7 @@
   ],
   "depends": [
     "Cro::HTTP:ver<0.8.11>:auth<zef:cro>",
+    "Cro::WebSocket:ver<0.8.10>:auth<zef:cro>",
     "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
     "UUID::V4:ver<1.0.0>:auth<zef:masukomi>"
   ],
@@ -17,6 +18,7 @@
   "provides": {
     "ComfyUI::API": "lib/ComfyUI/API.rakumod",
     "ComfyUI::API::Client": "lib/ComfyUI/API/Client.rakumod",
+    "ComfyUI::API::Exception": "lib/ComfyUI/API/Exception.rakumod",
     "ComfyUI::API::Result": "lib/ComfyUI/API/Result.rakumod",
     "ComfyUI::API::Workflow": "lib/ComfyUI/API/Workflow.rakumod"
   },
@@ -31,5 +33,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.1"
+  "version": "0.2.0"
 }

@@ -2,6 +2,19 @@ Revision history for ComfyUI::API
 
 {{$NEXT}}
 
+0.2.0  2026-05-12T03:17:52+01:00
+    - Add Client.health to probe /system_stats with a configurable timeout
+    - Add Client.list-checkpoints / list-loras / list-samplers / list-schedulers
+      / list-vaes — sorted, deduplicated parsing of /object_info enum fields,
+      with an optional :info hash to share one fetch across helpers
+    - Add X::ComfyUI::IntrospectionMissing for missing node-class / field cases
+    - Add Client.progress-supply (hot Supply over /ws WebSocket events) with
+      auto-reconnect; emits typed events: queue, execution-start, executing,
+      progress, executed, execution-end, error
+    - Add Client.parse-progress-message — pure parser exposed for testing and
+      custom WebSocket loops
+    - New dependency: Cro::WebSocket
+
 0.1.1  2026-04-29T23:43:24+01:00
     - Bump Github actions to use node 24+
 

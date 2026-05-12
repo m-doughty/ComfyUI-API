@@ -89,6 +89,96 @@ my %queue = $client.queue-status;
 my %nodes = $client.node-info;
 ```
 
+### Health probe
+
+`health` hits `/system_stats` with a short timeout and returns whether the server responded with 200. Useful as a connection check from a settings UI.
+
+```raku
+if $client.health(:timeout(2e0)) {
+    say "ComfyUI is up";
+}
+else {
+    say "Can't reach ComfyUI at {$client.base-url}";
+}
+```
+
+### Parsed object_info: list-checkpoints / list-loras / list-samplers / list-schedulers / list-vaes
+
+These walk the `/object_info` introspection tree and return sorted, de-duplicated filename or enum lists. Each accepts an optional pre-fetched `:%info` hash so a caller populating multiple dropdowns can fetch `/object_info` once and reuse.
+
+```raku
+# One HTTP call shared across helpers
+my %info       = $client.node-info;
+my @checkpoints = $client.list-checkpoints(:%info);
+my @loras       = $client.list-loras(:%info);
+my @samplers    = $client.list-samplers(:%info);
+my @schedulers  = $client.list-schedulers(:%info);
+my @vaes        = $client.list-vaes(:%info);
+
+# Or each call fetches independently
+my @ckpts = $client.list-checkpoints;
+```
+
+If a required node class (e.g. `LoraLoader`) isn't registered on the server — typically because a custom node pack is missing — these throw [X::ComfyUI::IntrospectionMissing](#x-comfyui-introspectionmissing) with the class name and field that couldn't be found.
+
+### Progress events: progress-supply
+
+`progress-supply` returns a hot [Supply](Supply) of typed progress events from ComfyUI's WebSocket interface (`/ws`). Each tap subscribes to all subsequent events; the underlying connection is shared across taps and reconnects automatically on socket drop. Filter by `prompt-id` to get events for a specific submission.
+
+```raku
+my $tap = $client.progress-supply.tap(-> %ev {
+    given %ev<type> {
+        when 'queue'           { say "queue pending: %ev<pending>" }
+        when 'execution-start' { say "started %ev<prompt-id>" }
+        when 'executing'       { say "running node %ev<node>" }
+        when 'progress'        { say "step %ev<value>/%ev<max> on %ev<node>" }
+        when 'executed'        { say "node %ev<node> finished" }
+        when 'execution-end'   { say "done %ev<prompt-id>" }
+        when 'error'           { say "error: %ev<message> at %ev<node>" }
+    }
+});
+
+# ... later
+$tap.close;
+```
+
+Emitted variants:
+
+    { type => 'queue',           pending => Int, running => Int }
+    { type => 'execution-start', prompt-id => Str }
+    { type => 'executing',       prompt-id => Str, node => Str }
+    { type => 'progress',        prompt-id => Str, value => Int, max => Int, node => Str }
+    { type => 'executed',        prompt-id => Str, node => Str, output => Hash }
+    { type => 'execution-end',   prompt-id => Str }
+    { type => 'error',           prompt-id => Str, message => Str, node => Str }
+
+### parse-progress-message
+
+The pure parser is exposed for callers who need to drive their own WebSocket loop or test against canned message hashes. Pass a decoded ComfyUI message hash (the raw JSON payload after `from-json`) and get back the same typed event hash that `progress-supply` would emit, or an empty hash for unrecognized messages and binary preview frames.
+
+```raku
+my %ev = $client.parse-progress-message(%(
+    type => 'progress',
+    data => %( value => 12, max => 30, prompt_id => 'abc', node => '7' ),
+));
+# %ev = { type => 'progress', prompt-id => 'abc', value => 12, max => 30, node => '7' }
+```
+
+X::ComfyUI::IntrospectionMissing
+--------------------------------
+
+Thrown by `list-checkpoints`, `list-loras`, `list-samplers`, `list-schedulers`, and `list-vaes` when a required node class or field is missing from the server's `/object_info`. Carries the `node-class` and `field` on the exception so callers can surface a helpful "your ComfyUI install is missing X" message.
+
+```raku
+use ComfyUI::API::Exception;
+
+CATCH {
+    when X::ComfyUI::IntrospectionMissing {
+        warn "Missing introspection: {.node-class}.{.field}";
+    }
+}
+```
+
 ComfyUI::API::Result
 --------------------
 

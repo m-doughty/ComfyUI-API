@@ -1,0 +1,98 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use ComfyUI::API::Client;
+use ComfyUI::API::Exception;
+
+# These tests parse a checked-in fixture of /object_info — no live ComfyUI required.
+# Live introspection tests live in 02-client.rakutest, gated on COMFYUI_URL.
+
+plan 9;
+
+my %info = from-json('t/fixtures/object-info-sample.json'.IO.slurp);
+my ComfyUI::API::Client $client .= new;
+
+subtest 'list-checkpoints parses CheckpointLoaderSimple.ckpt_name' => {
+	plan 3;
+	my @ckpts = $client.list-checkpoints(:%info);
+	is @ckpts.elems, 4, 'Four checkpoints in fixture';
+	ok 'flux1-dev.safetensors' ∈ @ckpts, 'Flux checkpoint present';
+	is @ckpts.join(','), @ckpts.sort.join(','), 'Sorted output';
+};
+
+subtest 'list-loras parses LoraLoader.lora_name' => {
+	plan 2;
+	my @loras = $client.list-loras(:%info);
+	is @loras.elems, 4, 'Four LoRAs in fixture';
+	ok 'alice-pony.safetensors' ∈ @loras, 'Alice LoRA present';
+};
+
+subtest 'list-samplers parses KSampler.sampler_name' => {
+	plan 3;
+	my @samplers = $client.list-samplers(:%info);
+	ok @samplers.elems > 5, 'Multiple samplers';
+	ok 'euler_ancestral' ∈ @samplers, 'euler_ancestral present';
+	ok 'dpmpp_2m' ∈ @samplers, 'dpmpp_2m present';
+};
+
+subtest 'list-schedulers parses KSampler.scheduler' => {
+	plan 2;
+	my @schedulers = $client.list-schedulers(:%info);
+	ok 'normal' ∈ @schedulers, 'normal scheduler';
+	ok 'karras' ∈ @schedulers, 'karras scheduler';
+};
+
+subtest 'list-vaes parses VAELoader.vae_name' => {
+	plan 2;
+	my @vaes = $client.list-vaes(:%info);
+	is @vaes.elems, 3, 'Three VAEs in fixture';
+	ok 'sdxl_vae.safetensors' ∈ @vaes, 'SDXL VAE present';
+};
+
+subtest 'IntrospectionMissing throws when node class absent' => {
+	plan 2;
+	my %trimmed = %info.clone;
+	%trimmed<LoraLoader>:delete;
+	my $err;
+	{
+		CATCH {
+			when X::ComfyUI::IntrospectionMissing {
+				$err = $_;
+				.resume;
+			}
+		}
+		try $client.list-loras(:info(%trimmed));
+		$err = $!;
+	}
+	isa-ok $err, X::ComfyUI::IntrospectionMissing, 'Throws IntrospectionMissing';
+	is $err.node-class, 'LoraLoader', 'Reports missing class';
+};
+
+subtest 'IntrospectionMissing throws when field absent' => {
+	plan 1;
+	my %trimmed = %info.clone;
+	%trimmed<CheckpointLoaderSimple><input><required><ckpt_name>:delete;
+	dies-ok { $client.list-checkpoints(:info(%trimmed)) },
+		'Throws when ckpt_name field is missing';
+};
+
+subtest 'list-* methods de-duplicate' => {
+	plan 1;
+	my %dup = %info.clone;
+	%dup<LoraLoader><input><required><lora_name>[0] = (
+		'alice-pony.safetensors',
+		'alice-pony.safetensors',
+		'bob-style-v2.safetensors',
+	);
+	my @loras = $client.list-loras(:info(%dup));
+	is @loras.elems, 2, 'Duplicates removed';
+};
+
+subtest 'health returns False against unreachable URL quickly' => {
+	plan 1;
+	my ComfyUI::API::Client $unreachable .= new(:base-url('http://127.0.0.1:1'));
+	my $start = now;
+	my $ok = $unreachable.health(:timeout(1.5e0));
+	my $elapsed = now - $start;
+	ok !$ok && $elapsed < 3, "health returned False within {$elapsed}s";
+};

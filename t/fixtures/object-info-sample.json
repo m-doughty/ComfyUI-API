@@ -1,0 +1,132 @@
+{
+  "CheckpointLoaderSimple": {
+    "input": {
+      "required": {
+        "ckpt_name": [
+          [
+            "ponyDiffusionV6XL_v6.safetensors",
+            "sd_xl_base_1.0.safetensors",
+            "flux1-dev.safetensors",
+            "anything-v5.safetensors"
+          ],
+          { "tooltip": "The name of the model checkpoint." }
+        ]
+      }
+    },
+    "input_order": { "required": ["ckpt_name"] },
+    "output": ["MODEL", "CLIP", "VAE"],
+    "output_is_list": [false, false, false],
+    "output_name": ["MODEL", "CLIP", "VAE"],
+    "name": "CheckpointLoaderSimple",
+    "display_name": "Load Checkpoint",
+    "description": "",
+    "category": "loaders"
+  },
+  "LoraLoader": {
+    "input": {
+      "required": {
+        "model": ["MODEL", { "tooltip": "The diffusion model the LoRA will be applied to." }],
+        "clip": ["CLIP", { "tooltip": "The CLIP model the LoRA will be applied to." }],
+        "lora_name": [
+          [
+            "alice-pony.safetensors",
+            "alice-flux.safetensors",
+            "bob-style-v2.safetensors",
+            "detail-tweaker-xl.safetensors"
+          ],
+          { "tooltip": "The name of the LoRA." }
+        ],
+        "strength_model": ["FLOAT", { "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01 }],
+        "strength_clip":  ["FLOAT", { "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01 }]
+      }
+    },
+    "input_order": { "required": ["model", "clip", "lora_name", "strength_model", "strength_clip"] },
+    "output": ["MODEL", "CLIP"],
+    "output_is_list": [false, false],
+    "output_name": ["MODEL", "CLIP"],
+    "name": "LoraLoader",
+    "display_name": "Load LoRA",
+    "category": "loaders"
+  },
+  "KSampler": {
+    "input": {
+      "required": {
+        "model": ["MODEL", {}],
+        "seed": ["INT", { "default": 0, "min": 0, "max": 18446744073709551615 }],
+        "steps": ["INT", { "default": 20, "min": 1, "max": 10000 }],
+        "cfg": ["FLOAT", { "default": 8.0, "min": 0.0, "max": 100.0, "step": 0.1 }],
+        "sampler_name": [
+          [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpm_2",
+            "dpm_2_ancestral",
+            "lms",
+            "dpm_fast",
+            "dpm_adaptive",
+            "dpmpp_2s_ancestral",
+            "dpmpp_sde",
+            "dpmpp_2m",
+            "ddim",
+            "uni_pc"
+          ],
+          {}
+        ],
+        "scheduler": [
+          ["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform"],
+          {}
+        ],
+        "positive": ["CONDITIONING", {}],
+        "negative": ["CONDITIONING", {}],
+        "latent_image": ["LATENT", {}],
+        "denoise": ["FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01 }]
+      }
+    },
+    "output": ["LATENT"],
+    "output_is_list": [false],
+    "output_name": ["LATENT"],
+    "name": "KSampler",
+    "display_name": "KSampler",
+    "category": "sampling"
+  },
+  "VAELoader": {
+    "input": {
+      "required": {
+        "vae_name": [
+          ["sdxl_vae.safetensors", "ae.safetensors", "vae-ft-mse-840000-ema-pruned.safetensors"],
+          {}
+        ]
+      }
+    },
+    "output": ["VAE"],
+    "output_is_list": [false],
+    "output_name": ["VAE"],
+    "name": "VAELoader",
+    "display_name": "Load VAE",
+    "category": "loaders"
+  },
+  "EmptyLatentImage": {
+    "input": {
+      "required": {
+        "width":  ["INT", { "default": 512, "min": 16, "max": 16384, "step": 8 }],
+        "height": ["INT", { "default": 512, "min": 16, "max": 16384, "step": 8 }],
+        "batch_size": ["INT", { "default": 1, "min": 1, "max": 4096 }]
+      }
+    },
+    "output": ["LATENT"],
+    "name": "EmptyLatentImage",
+    "category": "latent"
+  },
+  "CLIPSetLastLayer": {
+    "input": {
+      "required": {
+        "clip": ["CLIP", {}],
+        "stop_at_clip_layer": ["INT", { "default": -1, "min": -24, "max": -1 }]
+      }
+    },
+    "output": ["CLIP"],
+    "name": "CLIPSetLastLayer",
+    "category": "conditioning"
+  }
+}
