@@ -1,0 +1,88 @@
+use Test;
+use lib 'lib';
+
+use ComfyUI::API::Client;
+
+# Unit test for the per-request timeout inside .poll's loop. The
+# original implementation called `await $client.get(...)` and
+# `await $resp.body-text` with no timeout — Cro::HTTP::Client has
+# no built-in body-read timeout, so a stalled HTTP connection
+# hung indefinitely. The outer `now > $deadline` check sat AFTER
+# the await, so the documented C<:timeout> argument never kicked
+# in when a single request stalled.
+#
+# The fix wraps each HTTP call in C<Promise.anyof> + a per-request
+# deadline so a stall surfaces as a thrown exception within the
+# remaining timeout budget. Symptom this catches in production:
+# image-gen pipeline calls .poll AFTER set-state('downloading');
+# a stalled /history endpoint left the swipe row showing
+# "downloading image…" forever, with no log entry and no error.
+#
+# Test harness mirrors 07-download-timeout: a bare TCP listener
+# that accepts connections and never writes a byte is enough to
+# make Cro::HTTP::Client.get hang on body read.
+
+plan 2;
+
+my $listener = IO::Socket::Async.listen('127.0.0.1', 0);
+my @open-conns;
+
+my $tap = $listener.tap(
+    -> $conn { @open-conns.push($conn) },
+    quit => -> $err { },
+);
+
+my $port;
+react {
+    whenever Promise.in(2.0) { die "listener never bound"; }
+    whenever $tap.socket-port { $port = $_; done }
+}
+
+subtest 'poll throws within timeout when /history request stalls' => {
+    plan 3;
+    my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:$port");
+    my $t0 = now;
+    my $threw;
+    try {
+        $client.poll('my-prompt-id', :timeout(0.5e0), :interval(0.05e0));
+        CATCH {
+            default { $threw = $_ }
+        }
+    }
+    ok $threw.defined, 'poll did not return — an exception fired';
+    my $elapsed = now - $t0;
+    # poll's per-request budget floors at 0.5s (so the safety-net
+    # 0.1s timeout still gets one real attempt), so a 0.5s outer
+    # timeout means one stalled request consumes the full budget.
+    # We mainly care that it stops in bounded time rather than
+    # hanging forever.
+    ok $elapsed < 4,
+        "poll returned in bounded time ({$elapsed.fmt('%.2f')}s, timeout=0.5s)";
+    my $msg = ($threw // Mu).message // '';
+    ok $msg.contains('stalled') || $msg.contains('timed out'),
+        "exception message indicates a timeout / stall (got: {$msg.substr(0, 80)})";
+};
+
+subtest 'poll throws an HTTP error when the connection is refused' => {
+    plan 2;
+    # Pick a port nothing is listening on. macOS / Linux give us a
+    # connection-refused error fast — different code path than the
+    # stall test above; we want to confirm the start-block-failure
+    # branch in poll properly rethrows the underlying exception.
+    my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:1");
+    my $threw;
+    try {
+        $client.poll('my-prompt-id', :timeout(2e0), :interval(0.05e0));
+        CATCH {
+            default { $threw = $_ }
+        }
+    }
+    ok $threw.defined, 'poll surfaced an exception';
+    # Whatever Cro raises for a refused TCP connect — the point is
+    # the original error isn't swallowed.
+    my $msg = ($threw // Mu).message // '';
+    ok $msg.chars > 0, 'exception carries a non-empty message';
+};
+
+.close for @open-conns;
+$tap.close;

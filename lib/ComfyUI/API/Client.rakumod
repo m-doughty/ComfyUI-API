@@ -38,13 +38,48 @@ method submit(ComfyUI::API::Workflow:D $workflow --> Str:D) {
 	%result<prompt_id> // die "ComfyUI::API::Client: no prompt_id in response";
 }
 
+#|( Long-poll ComfyUI's C</history/$prompt-id> endpoint until the
+    prompt's row appears (sampling finished, outputs ready) or
+    C<:timeout> seconds elapse. Each individual HTTP call is raced
+    against the remaining deadline via C<Promise.anyof> — Cro's
+    client has no built-in body-read timeout, so a stalled
+    connection inside C<await $client.get> or C<await $resp.body-text>
+    would otherwise hang forever and the loop's own deadline check
+    sits B<after> those awaits. The per-call race converts a hung
+    request into a thrown timeout in bounded time, letting callers
+    (the orchestrator's outer CATCH) treat the failure as a regular
+    error instead of a silent stall. )
 method poll(Str:D $prompt-id, Num:D :$timeout = 300e0, Num:D :$interval = 1e0 --> ComfyUI::API::Result:D) {
 	my $client = Cro::HTTP::Client.new;
 	my Instant $deadline = now + $timeout;
 
 	loop {
-		my $resp = await $client.get("$!base-url/history/$prompt-id");
-		my $json = await $resp.body-text;
+		# Per-request budget: at least 0.5s so very-short outer
+		# timeouts (the safety-net poll uses 0.1s) still get one
+		# real attempt, capped at the remaining deadline so we
+		# don't outlast our own caller. Without the floor, an
+		# already-expired deadline would set $remaining to ~0 and
+		# Promise.in(0) would fire before $req's start block could
+		# even begin running.
+		my Num $remaining = max(($deadline - now), 0.5e0).Num;
+		my $req = start {
+			my $resp = await $client.get("$!base-url/history/$prompt-id");
+			await $resp.body-text;
+		};
+		await Promise.anyof($req, Promise.in($remaining));
+
+		my Str $json;
+		if $req.status ~~ Kept {
+			$json = $req.result;
+		} elsif $req.status ~~ Broken {
+			# Network / HTTP error from the start block. Re-raising
+			# via $req.result keeps the original exception so the
+			# orchestrator log can identify the failure mode.
+			$req.result;
+		} else {
+			die "ComfyUI::API::Client: HTTP request to /history/$prompt-id stalled mid-flight (no response within {$remaining.fmt('%.1f')}s); the request was abandoned and the overall poll timeout ({$timeout}s) won";
+		}
+
 		my %history = from-json($json);
 
 		if %history{$prompt-id}:exists {
@@ -67,11 +102,48 @@ method submit-and-wait(ComfyUI::API::Workflow:D $workflow, Num:D :$timeout = 300
 	self.poll($prompt-id, :$timeout, :$interval);
 }
 
-method download(Str:D $filename, Str :$subfolder = '', Str :$type = 'output' --> Buf:D) {
+#|( Fetch a generated image's bytes from C</view>. The body fetch is
+    raced against a C<Promise.in($timeout)> so a stalled connection
+    (ComfyUI never finishes streaming, dropped packets after the
+    headers arrive, output file missing on disk so the server hangs
+    on read) surfaces as an C<X::ComfyUI::DownloadTimeout> instead
+    of a permanent C<await>. Cro::HTTP::Client doesn't expose a
+    body-read timeout itself, which is why we race at the call site
+    rather than configuring the client. C<:timeout> defaults to 60s
+    \x{2014} healthy ComfyUI on LAN delivers a high-res PNG sub-second,
+    so 60s is generous enough to cover slow first-byte without
+    leaving the user staring at a frozen card.
+
+    =head2 Example
+    =begin code :lang<raku>
+    my $client = ComfyUI::API::Client.new;
+    my Buf $bytes = try $client.download('out.png');
+    if $! ~~ X::ComfyUI::DownloadTimeout {
+        # Surface the stall to the user; the card can flip to 'error'
+        # with the message and they can retry the generation.
+        note $!.message;
+    }
+    =end code )
+method download(Str:D $filename, Str :$subfolder = '', Str :$type = 'output',
+                Num:D :$timeout = 60e0 --> Buf:D) {
 	my $client = Cro::HTTP::Client.new;
 	my $url = "$!base-url/view?filename=$filename&subfolder=$subfolder&type=$type";
-	my $resp = await $client.get($url);
-	await $resp.body-blob;
+	my $fetch = start {
+		my $resp = await $client.get($url);
+		await $resp.body-blob;
+	};
+	my $deadline = Promise.in($timeout);
+	await Promise.anyof($fetch, $deadline);
+	if $fetch.status ~~ Kept {
+		return $fetch.result;
+	}
+	if $fetch.status ~~ Broken {
+		# Network / HTTP error finished before the timeout — surface
+		# the original exception rather than reporting a timeout we
+		# didn't actually hit.
+		$fetch.result;
+	}
+	die X::ComfyUI::DownloadTimeout.new(:$filename, :$timeout);
 }
 
 method queue-status(--> Hash) {
@@ -79,6 +151,72 @@ method queue-status(--> Hash) {
 	my $resp = await $client.get("$!base-url/queue");
 	my $json = await $resp.body-text;
 	from-json($json);
+}
+
+#|( Cancel a currently-executing prompt. Pass C<$prompt-id> for the
+    targeted frontend-compatible shape C<POST /interrupt
+    {"prompt_id":"..."}>. Calling without an id retains the older
+    global interrupt behaviour for callers that explicitly want it.
+    Returns silently on success; logs to STDERR on failure (network
+    down, auth, etc.) so a stuck or unreachable ComfyUI never blocks
+    the caller. Pair with C<delete-from-queue> when you have a
+    specific C<prompt_id> in mind: C<delete-from-queue> removes a
+    prompt that is queued-but-not-yet-running; targeted C<interrupt>
+    kills that prompt if it is running. Firing both is the safe play
+    when you don't know which state your prompt is in.
+
+    =head2 Example
+    =begin code :lang<raku>
+    my $client = ComfyUI::API::Client.new(base-url => 'http://localhost:8188');
+    my $prompt-id = $client.submit($workflow);
+    # ... user changes their mind ...
+    $client.delete-from-queue($prompt-id);
+    $client.interrupt($prompt-id);
+    =end code )
+method interrupt(Str $prompt-id? --> Nil) {
+	try {
+		my $http = Cro::HTTP::Client.new(:content-type<application/json>);
+		my %body = $prompt-id.defined && $prompt-id.chars
+			?? %( prompt_id => $prompt-id )
+			!! %();
+		await $http.post("$!base-url/interrupt", :body(to-json(%body)));
+		CATCH {
+			default {
+				note "ComfyUI::API::Client.interrupt failed: $_";
+			}
+		}
+	}
+}
+
+#|( Delete a specific prompt from the ComfyUI queue. Targets a prompt
+    that has been C<submit>ted but has not yet started sampling.
+    Quietly no-ops on an empty C<$prompt-id> (caller may not have
+    received an id yet — e.g. cancel fires during the LLM prompt-gen
+    phase, before the workflow is submitted to ComfyUI).
+
+    Errors (4xx if the id is unknown, network failure, etc.) are
+    logged to STDERR and absorbed; this method is intended for fire-
+    and-forget use from cancel handlers.
+
+    =head2 Example
+    =begin code :lang<raku>
+    $client.delete-from-queue($prompt-id);
+    =end code )
+method delete-from-queue(Str:D $prompt-id --> Nil) {
+	# `without` would be wrong here — .chars returns 0 for empty
+	# strings, and 0 is defined. `unless` short-circuits cleanly on
+	# the zero-length case (and on the unlikely Nil-coerced-to-Str).
+	return unless $prompt-id.chars;
+	try {
+		my $http = Cro::HTTP::Client.new(:content-type<application/json>);
+		await $http.post("$!base-url/queue",
+			:body(to-json({ delete => [$prompt-id] })));
+		CATCH {
+			default {
+				note "ComfyUI::API::Client.delete-from-queue($prompt-id) failed: $_";
+			}
+		}
+	}
 }
 
 method node-info(--> Hash) {

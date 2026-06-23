@@ -1,0 +1,95 @@
+use Test;
+use lib 'lib';
+
+use Cro::HTTP::Router;
+use Cro::HTTP::Server;
+use ComfyUI::API::Client;
+
+#|( Cancel methods are designed for fire-and-forget use from UI
+    threads — they must never throw on unreachable / failed servers,
+    or a cancel keybind could crash the host app. These tests use a
+    guaranteed-unreachable URL so the network call fails and we can
+    verify the error is absorbed rather than re-thrown. They run
+    unconditionally (no COMFYUI_URL gate), since "the client absorbs
+    failure" is the behaviour under test. )
+
+plan 5;
+
+my $client = ComfyUI::API::Client.new(
+	base-url => 'http://127.0.0.1:1',  # reserved unreachable port
+);
+
+subtest 'interrupt absorbs network failure' => {
+	plan 1;
+	lives-ok { $client.interrupt },
+		'interrupt against unreachable URL returns silently';
+};
+
+subtest 'delete-from-queue absorbs network failure' => {
+	plan 1;
+	lives-ok { $client.delete-from-queue('any-id') },
+		'delete-from-queue against unreachable URL returns silently';
+};
+
+subtest 'delete-from-queue short-circuits on empty prompt-id' => {
+	plan 1;
+	# Empty prompt-id means "no specific prompt to delete" — cancel
+	# paths that fire before submit returns an id hit this case.
+	# Must no-op without touching the network.
+	lives-ok { $client.delete-from-queue('') },
+		'empty prompt-id short-circuits before HTTP';
+};
+
+sub capture-requests(Int:D $count --> Hash) {
+	my @requests;
+	my $done = Promise.new;
+	my $port = 30000 + (^5000).pick;
+	my $app = route {
+		post -> 'queue' {
+			request-body -> %body {
+				@requests.push: %( path => '/queue', body => %body.Hash );
+				$done.keep if @requests.elems >= $count && $done.status !~~ Kept;
+				content 'application/json', '{}';
+			}
+		}
+		post -> 'interrupt' {
+			request-body -> %body {
+				@requests.push: %( path => '/interrupt', body => %body.Hash );
+				$done.keep if @requests.elems >= $count && $done.status !~~ Kept;
+				content 'application/json', '{}';
+			}
+		}
+	}
+	my $server = Cro::HTTP::Server.new(:host<127.0.0.1>, :$port, :application($app));
+	$server.start;
+	%( server => $server, :$port, requests => @requests, done => $done );
+}
+
+subtest 'queued delete and targeted interrupt send exact Comfy payloads' => {
+	plan 4;
+	my %srv = capture-requests(2);
+	LEAVE { %srv<server>.stop if %srv<server>.defined }
+	my $targeted = ComfyUI::API::Client.new(
+		base-url => "http://127.0.0.1:{%srv<port>}",
+	);
+
+	$targeted.delete-from-queue('prompt-123');
+	$targeted.interrupt('prompt-123');
+	await Promise.anyof(%srv<done>, Promise.in(3));
+
+	my @requests = %srv<requests>.Array;
+	is @requests[0]<path>, '/queue', 'queued prompt deletion uses /queue';
+	is-deeply @requests[0]<body>, %( delete => ['prompt-123'] ),
+		'queued prompt deletion body matches Comfy frontend';
+	is @requests[1]<path>, '/interrupt', 'running prompt interrupt uses /interrupt';
+	is-deeply @requests[1]<body>, %( prompt_id => 'prompt-123' ),
+		'targeted interrupt body carries prompt_id';
+};
+
+subtest 'cancel methods return Nil' => {
+	plan 2;
+	is $client.interrupt, Nil,
+		'interrupt has Nil return type';
+	is $client.delete-from-queue(''), Nil,
+		'delete-from-queue has Nil return type';
+};

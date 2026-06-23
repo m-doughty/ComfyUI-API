@@ -1,0 +1,91 @@
+use Test;
+use lib 'lib';
+
+use ComfyUI::API::Client;
+use ComfyUI::API::Exception;
+
+# Unit test for X::ComfyUI::DownloadTimeout, the timeout the
+# download method enforces around the HTTP body fetch.
+#
+# Cro::HTTP::Client doesn't surface a body-read timeout itself, so a
+# server that opens the connection and then stalls leaves the
+# `await $resp.body-blob` permanently pending. The download method
+# races the body fetch against a `Promise.in($timeout)` so callers
+# get a real exception instead of a silent hang — that's the
+# regression this guards against.
+#
+# We don't need a real ComfyUI here. A bare TCP listener that
+# accepts connections and never writes any HTTP bytes is enough to
+# make Cro::HTTP::Client.get hang forever; that's exactly the shape
+# of "ComfyUI accepted the request but its body stream stalls" the
+# fix targets.
+
+plan 3;
+
+# Bind to an OS-assigned port so concurrent test runs don't clash.
+my $listener = IO::Socket::Async.listen('127.0.0.1', 0);
+my $port-promise = Promise.new;
+my @open-conns;
+
+my $tap = $listener.tap(
+    -> $conn {
+        # Accept and hold — never write an HTTP response. This is
+        # what a stalled ComfyUI looks like from the client's POV.
+        @open-conns.push($conn);
+    },
+    quit => -> $err { },
+);
+
+# Drive the listener to bind so we learn the port. The Supply
+# starts paused until tapped; tap above primes it.
+my $port;
+react {
+    whenever Promise.in(2.0) { die "listener never bound"; }
+    whenever $tap.socket-port { $port = $_; done }
+}
+
+ok $port > 0, "test TCP listener bound on port $port";
+
+subtest 'download throws X::ComfyUI::DownloadTimeout when body never arrives' => {
+    plan 3;
+    my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:$port");
+    my $t0 = now;
+    my $threw;
+    try {
+        $client.download('whatever.png', :timeout(0.5e0));
+        CATCH {
+            default { $threw = $_ }
+        }
+    }
+    ok $threw.defined, 'download did not return — an exception fired';
+    ok $threw ~~ X::ComfyUI::DownloadTimeout,
+        "exception is X::ComfyUI::DownloadTimeout (got {$threw.WHAT.^name})";
+    my $elapsed = now - $t0;
+    # Generous upper bound: we expect ~0.5s + a tiny scheduling
+    # overhead. The point is the call returned in bounded time
+    # rather than hanging.
+    ok $elapsed < 3,
+        "download returned within bounded time ({$elapsed.fmt('%.2f')}s, timeout=0.5s)";
+};
+
+subtest 'X::ComfyUI::DownloadTimeout message includes filename + timeout' => {
+    plan 2;
+    my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:$port");
+    my $threw;
+    try {
+        $client.download('my-stalled-file.png', :timeout(0.2e0));
+        CATCH {
+            default { $threw = $_ }
+        }
+    }
+    my $msg = ($threw // Mu).message // '';
+    ok $msg.contains('my-stalled-file.png'),
+        'exception message mentions the stalled filename';
+    ok $msg.contains('0.2'),
+        'exception message mentions the configured timeout';
+};
+
+# Tear down: close any open connections + cancel the listener so
+# the test doesn't leak sockets across runs under prove6.
+.close for @open-conns;
+$tap.close;

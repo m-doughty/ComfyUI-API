@@ -2,6 +2,18 @@ Revision history for ComfyUI::API
 
 {{$NEXT}}
 
+0.2.1  2026-06-23T01:30:50+01:00
+    - Add Client.interrupt and Client.delete-from-queue for fire-and-forget
+      cancellation of running or queued prompts, including targeted
+      prompt_id payloads compatible with ComfyUI's frontend API
+    - Add bounded timeout handling for stalled /history polling and /view
+      downloads so hung ComfyUI HTTP responses surface as errors instead of
+      leaving callers blocked indefinitely
+    - Add X::ComfyUI::DownloadTimeout for download body stalls, with filename
+      and timeout details in the exception message
+    - Add tests for cancel request payloads, absorbed cancel failures,
+      download timeouts, and stalled/refused poll requests
+
 0.2.0  2026-05-12T03:17:52+01:00
     - Add Client.health to probe /system_stats with a configurable timeout
     - Add Client.list-checkpoints / list-loras / list-samplers / list-schedulers

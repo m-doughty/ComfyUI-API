@@ -11,7 +11,7 @@ use ComfyUI::API::Client;
 use ComfyUI::API::Workflow;
 use ComfyUI::API::Result;
 
-plan 4;
+plan 5;
 
 my Str:D $url = %*ENV<COMFYUI_URL>;
 my ComfyUI::API::Client $client .= new(:base-url($url));
@@ -80,3 +80,22 @@ subtest 'submit with custom seed produces result' => {
 	ok $result.image-filenames.elems > 0, 'Generated image with custom seed';
 	ok $result.images[0]<type> eq 'temp', 'Preview image stored in temp';
 };
+
+subtest 'interrupt and delete-from-queue return without error' => {
+	plan 3;
+	# interrupt is fire-and-forget: it either kills a running prompt
+	# or no-ops if nothing is running. Either way it returns silently.
+	lives-ok { $client.interrupt }, 'interrupt against idle server is a no-op';
+
+	# delete-from-queue with an unknown id should 4xx upstream but
+	# the client absorbs it (logged to STDERR).
+	lives-ok { $client.delete-from-queue('non-existent-prompt-id') },
+		'delete-from-queue absorbs unknown-prompt-id error';
+
+	# Empty prompt-id short-circuits before the network call — useful
+	# for cancel paths that fire before the orchestrator has received
+	# a prompt_id back from submit (mid-prompt-gen cancel).
+	lives-ok { $client.delete-from-queue('') },
+		'delete-from-queue no-ops on empty prompt-id';
+};
+
