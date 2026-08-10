@@ -1,0 +1,299 @@
+use Test;
+use lib 'lib';
+
+use Cro::HTTP::Client;
+use Cro::HTTP::Router;
+use Cro::HTTP::Server;
+use JSON::Fast;
+
+use ComfyUI::API::Client;
+use ComfyUI::API::Result;
+use ComfyUI::API::Workflow;
+
+# Response-body decoding, against a real HTTP server.
+#
+# Cro::HTTP::Message.body-text-encoding returns the LIST
+# ('utf-8', 'latin-1') whenever the Content-Type names no charset, and
+# Cro::MessageWithBody.body-text loops that list with no `last` — so the
+# latin-1 attempt, which cannot fail whatever the bytes are, always
+# overwrites the correct utf-8 decode. Everything this client reads as
+# text is JSON, and ComfyUI echoes the submitted workflow straight back
+# out of /history: prompt text, node titles, checkpoint filenames and
+# Python exception messages, all routinely non-ASCII. Anything routed
+# through body-text came back as mojibake: café -> cafÃ©.
+#
+# The client now decodes response bytes itself (_blob-text /
+# _body-text). Every fixture route below answers charset-less bytes, so
+# each assertion is that the text survived the round trip byte for
+# byte — and that the /view download path, which is genuinely binary,
+# still hands back the bytes untouched.
+
+plan 8;
+
+# Non-ASCII from every corner that bites a latin-1 decode: 2-byte
+# accented latin, 3-byte symbol, 3-byte CJK, curly punctuation, and a
+# 4-byte astral-plane emoji.
+constant SAMPLE     = "café ✓ 日本語 — “quoted” 🎲";
+constant CHECKPOINT = "modèle-café_v2.safetensors";
+constant OOPS       = "nœud « KSampler » a échoué — 日本語";
+constant PROMPT-ID  = 'fixture-prompt-1';
+
+# A body that is not valid UTF-8 anywhere: PNG magic, a UTF-16 BOM, and
+# a lone 0xE9 (é in latin-1, an invalid UTF-8 lead byte). If the
+# download path ever stopped being blob-clean this would not survive.
+constant PNG = Blob.new(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                        0xFF, 0xFE, 0xE9, 0x00, 0x80, 0xC0);
+
+constant TIMEOUT = 30;
+
+sub json-blob(\payload --> Blob) {
+	to-json(payload, :!pretty).encode('utf-8');
+}
+
+#| Await $promise, giving up (loudly) rather than blocking forever.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise.result;
+}
+
+# === The fixture server ===
+#
+# Every route answers bytes with a Content-Type carrying NO charset
+# parameter — the shape that trips Cro's fallback. (Cro's `content`
+# only appends a charset when handed a Str; a Blob body is emitted
+# as-is.) The leading path segment selects the behaviour under test,
+# because the client builds its URLs as "$base-url/prompt" and friends.
+
+my $app = route {
+	post -> 'ok', 'prompt' {
+		content 'application/json', json-blob({ prompt_id => PROMPT-ID });
+	}
+
+	# ComfyUI rejects an unsatisfiable workflow with a JSON error body;
+	# submit lifts the message into the exception it throws.
+	post -> 'bad', 'prompt' {
+		content 'application/json', json-blob({ error => OOPS });
+	}
+
+	# /history echoes the submitted workflow back verbatim alongside the
+	# outputs — the prompt text is the biggest non-ASCII surface the
+	# client has.
+	get -> 'ok', 'history', $prompt-id {
+		content 'application/json', json-blob({
+			$prompt-id => {
+				outputs => {
+					'9' => {
+						images => [
+							{ filename => 'café.png', subfolder => '', type => 'output' },
+						],
+					},
+				},
+				prompt => [ 0, $prompt-id, { '6' => { inputs => { text => SAMPLE } } } ],
+			},
+		});
+	}
+
+	get -> 'ok', 'queue' {
+		content 'application/json', json-blob({
+			queue_running => [ [ 0, PROMPT-ID, { note => SAMPLE } ], ],
+			queue_pending => [],
+		});
+	}
+
+	# A proxy (or a custom node) that answers JSON under the wrong
+	# label. Reading `await .body` here would route through Cro's
+	# parser selector, miss the JSON parser, and hand back a Str that
+	# from-json's callers would index as a Hash — silently empty.
+	get -> 'mislabel', 'queue' {
+		content 'text/plain', json-blob({
+			queue_running => [ [ 0, PROMPT-ID, { note => SAMPLE } ], ],
+			queue_pending => [],
+		});
+	}
+
+	get -> 'ok', 'object_info' {
+		content 'application/json', json-blob({
+			CheckpointLoaderSimple => {
+				input => {
+					required => {
+						# /object_info enum fields are [[values...], {meta}].
+						ckpt_name => [ [ CHECKPOINT, 'plain.safetensors' ], {} ],
+					},
+				},
+			},
+		});
+	}
+
+	# Genuinely binary: must stay a Blob, never touch a text decode.
+	get -> 'ok', 'view' {
+		content 'image/png', PNG;
+	}
+};
+
+#| Start the fixture on a random high port, retrying in case something
+#| else already owns the one we picked. Cro cannot report the port an
+#| OS-assigned :port(0) landed on, so the port is chosen here and a real
+#| request is the only honest proof that the listener is ours.
+sub boot(--> List) {
+	my $last-error = 'no attempt made';
+
+	for ^5 {
+		my $port   = (20000 .. 40000).pick;
+		my $server = Cro::HTTP::Server.new(
+			:host<127.0.0.1>, :$port, application => $app,
+		);
+
+		my Bool $listening = True;
+		{
+			CATCH {
+				default {
+					$last-error = .message.lines.head;
+					$listening  = False;
+				}
+			}
+			$server.start;
+		}
+
+		if $listening {
+			my $probe = Cro::HTTP::Client.new(:!persistent, :http<1.1>)
+				.get("http://127.0.0.1:$port/ok/queue");
+			await Promise.anyof($probe, Promise.in(10));
+			return ($server, $port) if $probe.status === Kept;
+
+			$last-error = $probe.status === Broken
+				?? $probe.cause.message.lines.head
+				!! 'probe request timed out';
+			try $server.stop;
+		}
+	}
+
+	die "Could not start the fixture server on any port: $last-error";
+}
+
+my ($server, $port) = boot();
+LEAVE { try $server.stop with $server }
+
+sub base(Str:D $prefix = 'ok' --> Str:D) { "http://127.0.0.1:$port/$prefix" }
+
+sub make-client(Str:D $prefix = 'ok' --> ComfyUI::API::Client:D) {
+	ComfyUI::API::Client.new(:base-url(base($prefix)), :client-id<test-client>);
+}
+
+my ComfyUI::API::Workflow $workflow = ComfyUI::API::Workflow.from-hash({
+	'6' => { class_type => 'CLIPTextEncode', inputs => { text => SAMPLE } },
+});
+
+# === 1: the decode helper in isolation ===
+
+subtest 'the decode helper' => {
+	plan 6;
+	my $client = make-client;
+
+	is $client._blob-text(SAMPLE.encode('utf-8')), SAMPLE,
+		'multi-byte UTF-8 survives the round trip';
+	is $client._blob-text(SAMPLE.encode('utf-8')).chars, SAMPLE.chars,
+		'no latin-1 expansion into one character per byte';
+	is $client._blob-text('plain ascii'.encode('utf-8')), 'plain ascii',
+		'ASCII is unchanged';
+	# 0xE9 alone is 'é' in latin-1 and an invalid UTF-8 lead byte, so it
+	# can only come back via the fallback.
+	is $client._blob-text(Blob.new(0xE9, 0x21)), 'é!',
+		'undecodable UTF-8 falls back to latin-1';
+	is $client._blob-text(Blob.new), '',
+		'an empty body reads as the empty string';
+	is $client._blob-text(Blob), '',
+		'an undefined body reads as the empty string rather than throwing';
+};
+
+# === 2: the fixture's own premise ===
+
+subtest 'the fixture really does omit the charset' => {
+	plan 3;
+
+	# If this ever stops holding, every round-trip assertion below goes
+	# vacuous: Cro's body-text is correct when a charset is declared.
+	my $http = Cro::HTTP::Client.new(:!persistent, :http<1.1>);
+
+	my $json = timed($http.get(base() ~ '/queue'), 'the charset probe');
+	my $type = $json.header('content-type') // '';
+	like $type, /^ 'application/json' /, 'JSON served as application/json';
+	unlike $type, /:i 'charset'/, 'with no charset parameter';
+
+	my $png = timed($http.get(base() ~ '/view'), 'the download probe');
+	like $png.header('content-type') // '', /^ 'image/png' /,
+		'the download route serves image/png';
+};
+
+# === 3-6: the JSON paths ===
+
+subtest 'submit round-trips the prompt id and error text' => {
+	plan 3;
+
+	is make-client.submit($workflow), PROMPT-ID, 'prompt id came back';
+
+	my $threw;
+	try {
+		make-client('bad').submit($workflow);
+		CATCH { default { $threw = $_ } }
+	}
+	ok $threw.defined, 'a rejection body threw';
+	ok ($threw.message // '').contains(OOPS),
+		'the rejection message survived the round trip byte for byte';
+};
+
+subtest 'poll round-trips the echoed workflow' => {
+	plan 3;
+	my ComfyUI::API::Result $result =
+		make-client.poll(PROMPT-ID, :timeout(10e0), :interval(0.05e0));
+
+	is $result.prompt-id, PROMPT-ID, 'result carries the prompt id';
+	is $result.image-filenames.head, 'café.png',
+		'output filename survived the round trip';
+	is $result.raw<prompt>[2]<6><inputs><text>, SAMPLE,
+		'the echoed prompt text survived the round trip byte for byte';
+};
+
+subtest 'queue-status round-trips non-ASCII' => {
+	plan 2;
+	my %status = make-client.queue-status;
+
+	ok %status<queue_pending>:exists, 'queue shape came through';
+	is %status<queue_running>[0][2]<note>, SAMPLE,
+		'queued entry text survived the round trip byte for byte';
+};
+
+subtest 'JSON mislabelled as text/plain still parses' => {
+	plan 2;
+	my %status = make-client('mislabel').queue-status;
+
+	ok %status<queue_pending>:exists,
+		'a lying Content-Type did not turn the body into an unindexable Str';
+	is %status<queue_running>[0][2]<note>, SAMPLE,
+		'and the text still survived the round trip byte for byte';
+};
+
+subtest 'node-info round-trips non-ASCII checkpoint names' => {
+	plan 3;
+	my $client = make-client;
+	my %info   = $client.node-info;
+
+	ok %info<CheckpointLoaderSimple>:exists, 'introspection payload came through';
+
+	my @ckpts = $client.list-checkpoints(:info(%info));
+	is @ckpts.elems, 2, 'both checkpoints listed';
+	ok CHECKPOINT ∈ @ckpts,
+		"the accented checkpoint name survived the round trip (got: {@ckpts.join(', ')})";
+};
+
+# === 7: the binary path stays binary ===
+
+subtest 'download hands back the bytes untouched' => {
+	plan 3;
+	my Buf $bytes = make-client.download('café.png', :timeout(10e0));
+
+	is $bytes.elems, PNG.elems, "downloaded {$bytes.elems} bytes";
+	is-deeply $bytes.list, PNG.list,
+		'bytes are byte-identical — no text decode on the download path';
+	ok $bytes[0] == 0x89 && $bytes[1] == 0x50, 'PNG magic intact';
+};

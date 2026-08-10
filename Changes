@@ -2,6 +2,27 @@ Revision history for ComfyUI::API
 
 {{$NEXT}}
 
+0.2.2  2026-08-10T20:24:46+01:00
+    - Fix mojibake on every JSON response body. Cro's body-text falls back
+      to the encoding list ('utf-8', 'latin-1') when the Content-Type names
+      no charset, and loops it without stopping on the first success, so the
+      latin-1 attempt always overwrote the correct utf-8 decode: café came
+      back as cafÃ©. submit, poll, queue-status and node-info now decode the
+      response bytes as UTF-8 themselves (JSON is UTF-8 per RFC 8259), with
+      latin-1 kept only as a fallback for bodies utf-8 cannot decode at all.
+      Affected the prompt text, node titles, checkpoint / LoRA filenames and
+      Python exception messages ComfyUI echoes back out of /history.
+    - Reading the bytes instead of `await $resp.body` also makes the parse
+      depend on the payload rather than the Content-Type, so a reverse proxy
+      or custom node that answers JSON as text/plain no longer yields an
+      unindexable Str that silently reads as empty.
+    - The /view download path is unchanged — it was already blob-clean, and
+      a regression test now pins that image bytes are never text-decoded.
+    - Add t/09-body-encoding.rakutest: a live Cro::HTTP::Server fixture whose
+      routes all answer charset-less bytes, covering the decode helper in
+      isolation plus submit / poll / queue-status / node-info / download end
+      to end.
+
 0.2.1  2026-06-23T01:30:50+01:00
     - Add Client.interrupt and Client.delete-from-queue for fire-and-forget
       cancellation of running or queued prompts, including targeted

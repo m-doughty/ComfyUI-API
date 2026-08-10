@@ -19,6 +19,63 @@ submethod TWEAK() {
 	$!client-id //= uuid-v4();
 }
 
+#|( Decode response bytes as text ourselves rather than letting Cro
+    do it.
+
+    Cro asks C<body-text-encoding> for an encoding, and when the
+    Content-Type names no charset that method returns the LIST
+    C<('utf-8', 'latin-1')> (Cro::HTTP::Message). C<body-text> in
+    Cro::MessageWithBody then loops over that list with no C<last>, so
+    the latin-1 attempt — which cannot fail, whatever the bytes are —
+    always overwrites the successful utf-8 decode. Every charset-less
+    response therefore came back as mojibake: café -> cafÃ©.
+
+    Every text body this client reads is JSON, and JSON is UTF-8 by
+    definition (RFC 8259 §8.1), so utf-8 is the only correct reading
+    of one. That matters here because ComfyUI echoes the submitted
+    workflow back out of C</history>: the payload carries the prompt
+    text verbatim, alongside node titles, checkpoint / LoRA filenames
+    and Python exception messages, all of which routinely contain
+    non-ASCII. Whether the charset is present at all is not something
+    a client can rely on — custom nodes register their own aiohttp
+    routes, and installs are commonly fronted by a reverse proxy or
+    tunnel that rewrites headers.
+
+    latin-1 survives only as a fallback for the non-JSON page such a
+    proxy might answer with, and is reached only when the utf-8 decode
+    throws — never in preference to a decode that worked.
+
+    Never throws: an undefined, empty or undecodable blob all read as
+    the empty string. )
+method _blob-text($blob --> Str:D) {
+	# Untyped on purpose — callers hand us whatever the body await
+	# produced, and this is the helper that must not itself be the
+	# thing that throws.
+	return '' unless $blob ~~ Blob:D;
+	(try $blob.decode('utf-8')) // (try $blob.decode('latin-1')) // '';
+}
+
+#|( C<_blob-text> over a whole response.
+
+    Unlike C<_blob-text> this B<does> propagate: C<await .body-blob>
+    is deliberately left bare so a connection dropped mid-body still
+    surfaces as the transport exception C<poll>'s stall handling is
+    written against, rather than collapsing into an empty string that
+    C<from-json> would then report as a bogus parse failure.
+
+    Note this reads the raw bytes rather than C<await .body>, which
+    routes through Cro's body-parser selector and so reaches the JSON
+    parser only while the server labels the payload
+    C<application/json> — a body labelled C<text/plain> lands on
+    Cro's text fallback (mojibake again), and an unlabelled one on the
+    blob fallback, handing back a Buf that the callers below would
+    then index as a Hash and silently read as empty. Parsing the
+    bytes ourselves makes the result depend on the payload rather
+    than on a header. )
+method _body-text($resp --> Str:D) {
+	self._blob-text(await $resp.body-blob);
+}
+
 method submit(ComfyUI::API::Workflow:D $workflow --> Str:D) {
 	my %body = %(
 		prompt    => $workflow.to-hash,
@@ -29,7 +86,7 @@ method submit(ComfyUI::API::Workflow:D $workflow --> Str:D) {
 	my $resp = await $client.post("$!base-url/prompt",
 		:body(to-json(%body)),
 	);
-	my $json = await $resp.body-text;
+	my $json = self._body-text($resp);
 	my %result = from-json($json);
 
 	die "ComfyUI::API::Client: prompt rejected: {%result<error> // 'unknown error'}"
@@ -43,9 +100,10 @@ method submit(ComfyUI::API::Workflow:D $workflow --> Str:D) {
     C<:timeout> seconds elapse. Each individual HTTP call is raced
     against the remaining deadline via C<Promise.anyof> — Cro's
     client has no built-in body-read timeout, so a stalled
-    connection inside C<await $client.get> or C<await $resp.body-text>
-    would otherwise hang forever and the loop's own deadline check
-    sits B<after> those awaits. The per-call race converts a hung
+    connection inside C<await $client.get> or the body read in
+    C<_body-text> would otherwise hang forever and the loop's own
+    deadline check sits B<after> those awaits. The per-call race
+    converts a hung
     request into a thrown timeout in bounded time, letting callers
     (the orchestrator's outer CATCH) treat the failure as a regular
     error instead of a silent stall. )
@@ -64,7 +122,7 @@ method poll(Str:D $prompt-id, Num:D :$timeout = 300e0, Num:D :$interval = 1e0 --
 		my Num $remaining = max(($deadline - now), 0.5e0).Num;
 		my $req = start {
 			my $resp = await $client.get("$!base-url/history/$prompt-id");
-			await $resp.body-text;
+			self._body-text($resp);
 		};
 		await Promise.anyof($req, Promise.in($remaining));
 
@@ -149,8 +207,7 @@ method download(Str:D $filename, Str :$subfolder = '', Str :$type = 'output',
 method queue-status(--> Hash) {
 	my $client = Cro::HTTP::Client.new;
 	my $resp = await $client.get("$!base-url/queue");
-	my $json = await $resp.body-text;
-	from-json($json);
+	from-json(self._body-text($resp));
 }
 
 #|( Cancel a currently-executing prompt. Pass C<$prompt-id> for the
@@ -222,8 +279,7 @@ method delete-from-queue(Str:D $prompt-id --> Nil) {
 method node-info(--> Hash) {
 	my $client = Cro::HTTP::Client.new;
 	my $resp = await $client.get("$!base-url/object_info");
-	my $json = await $resp.body-text;
-	from-json($json);
+	from-json(self._body-text($resp));
 }
 
 method health(Num:D :$timeout = 3e0 --> Bool:D) {
@@ -403,6 +459,12 @@ method !start-progress-worker(--> Nil) {
 						LAST { done }
 						next unless $msg.is-text;
 						try {
+							# Not the charset-less-HTTP hazard _blob-text
+							# exists for: Cro::WebSocket::Message.body-text-encoding
+							# answers the single Str 'utf-8' for a text
+							# frame (RFC 6455 mandates UTF-8), so body-text
+							# takes the single-encoding branch and never
+							# reaches the latin-1-overwrites-utf-8 loop.
 							my $text    = await $msg.body-text;
 							my %decoded = from-json($text);
 							my %event   = self.parse-progress-message(%decoded);
