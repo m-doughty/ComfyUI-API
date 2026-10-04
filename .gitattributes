@@ -1,0 +1,51 @@
+# Line endings: LF in the repository and in every working tree.
+#
+# `text=auto` keeps git's own text-or-binary detection; `eol=lf` then
+# checks every text file out with LF on every platform, whatever
+# `core.autocrlf` says locally. A Windows checkout — Windows Terminal,
+# msys2, GitHub's windows-latest runners, which default to
+# core.autocrlf=true — gets the same bytes as a macOS or Linux one, so
+# a shell script, a Pod file, a golden snapshot or a fixture never
+# grows a trailing \r.
+#
+# Takes effect from the next `git add`. Files already in the index keep
+# the bytes they were committed with until a one-off
+# `git add --renormalize .` is committed from any clone.
+* text=auto eol=lf
+
+# cmd.exe mis-parses an LF-only batch file, so batch files are the one
+# kind of text that must reach the disk as CRLF. They are still stored
+# LF in the repository.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never converted, never diffed as text.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.bmp    binary
+*.webp   binary
+*.xcf    binary
+*.ico    binary
+*.gz     binary
+*.tgz    binary
+*.zip    binary
+*.tar    binary
+*.onnx   binary
+*.db     binary
+*.sqlite binary
+*.dll    binary
+*.so     binary
+*.dylib  binary
+*.a      binary
+*.lib    binary
+*.exe    binary
+*.mov    binary
+*.mp4    binary
+*.wav    binary
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary
+*.pdf    binary

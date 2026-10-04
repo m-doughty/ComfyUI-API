@@ -8,7 +8,7 @@
   "depends": [
     "Cro::HTTP:ver<0.8.11>:auth<zef:cro>",
     "Cro::WebSocket:ver<0.8.10>:auth<zef:cro>",
-    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
+    "JSON::Fast:ver<0.21.0+>:auth<zef:timo>",
     "UUID::V4:ver<1.0.0>:auth<zef:masukomi>"
   ],
   "description": "Raku client for the ComfyUI image generation API with workflow templating",
@@ -33,5 +33,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.2"
+  "version": "0.3.0"
 }

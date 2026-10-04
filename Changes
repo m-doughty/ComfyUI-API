@@ -2,6 +2,13 @@ Revision history for ComfyUI::API
 
 {{$NEXT}}
 
+0.3.0  2026-10-04T22:22:55+01:00
+
+    - Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19 (cpan:TIMOTIMO)
+      fails its own tests under the RakuAST compiler frontend that Rakudo
+      2026.09 makes the default, so installing this distribution stopped
+      at that dependency.
+
 0.2.2  2026-08-10T20:24:46+01:00
     - Fix mojibake on every JSON response body. Cro's body-text falls back
       to the encoding list ('utf-8', 'latin-1') when the Content-Type names

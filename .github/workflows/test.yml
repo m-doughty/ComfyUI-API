@@ -16,8 +16,8 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
-        raku-version:
-          - 'latest'
+        # 2026.07: last legacy-frontend release. 2026.09: RakuAST is the default.
+        raku-version: ['2026.07', '2026.09']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
