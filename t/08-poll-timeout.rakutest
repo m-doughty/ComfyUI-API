@@ -28,60 +28,60 @@ my $listener = IO::Socket::Async.listen('127.0.0.1', 0);
 my @open-conns;
 
 my $tap = $listener.tap(
-    -> $conn { @open-conns.push($conn) },
-    quit => -> $err { },
+	-> $conn { @open-conns.push($conn) },
+	quit => -> $err { },
 );
 
 my $port;
 react {
-    whenever Promise.in(2.0) { die "listener never bound"; }
-    whenever $tap.socket-port { $port = $_; done }
+	whenever Promise.in(2.0) { die "listener never bound"; }
+	whenever $tap.socket-port { $port = $_; done }
 }
 
 subtest 'poll throws within timeout when /history request stalls' => {
-    plan 3;
-    my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:$port");
-    my $t0 = now;
-    my $threw;
-    try {
-        $client.poll('my-prompt-id', :timeout(0.5e0), :interval(0.05e0));
-        CATCH {
-            default { $threw = $_ }
-        }
-    }
-    ok $threw.defined, 'poll did not return — an exception fired';
-    my $elapsed = now - $t0;
-    # poll's per-request budget floors at 0.5s (so the safety-net
-    # 0.1s timeout still gets one real attempt), so a 0.5s outer
-    # timeout means one stalled request consumes the full budget.
-    # We mainly care that it stops in bounded time rather than
-    # hanging forever.
-    ok $elapsed < 4,
-        "poll returned in bounded time ({$elapsed.fmt('%.2f')}s, timeout=0.5s)";
-    my $msg = ($threw // Mu).message // '';
-    ok $msg.contains('stalled') || $msg.contains('timed out'),
-        "exception message indicates a timeout / stall (got: {$msg.substr(0, 80)})";
+	plan 3;
+	my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:$port");
+	my $t0 = now;
+	my $threw;
+	try {
+		$client.poll('my-prompt-id', :timeout(0.5e0), :interval(0.05e0));
+		CATCH {
+			default { $threw = $_ }
+		}
+	}
+	ok $threw.defined, 'poll did not return — an exception fired';
+	my $elapsed = now - $t0;
+	# poll's per-request budget floors at 0.5s (so the safety-net
+	# 0.1s timeout still gets one real attempt), so a 0.5s outer
+	# timeout means one stalled request consumes the full budget.
+	# We mainly care that it stops in bounded time rather than
+	# hanging forever.
+	ok $elapsed < 4,
+		"poll returned in bounded time ({$elapsed.fmt('%.2f')}s, timeout=0.5s)";
+	my $msg = ($threw // Mu).message // '';
+	ok $msg.contains('stalled') || $msg.contains('timed out'),
+		"exception message indicates a timeout / stall (got: {$msg.substr(0, 80)})";
 };
 
 subtest 'poll throws an HTTP error when the connection is refused' => {
-    plan 2;
-    # Pick a port nothing is listening on. macOS / Linux give us a
-    # connection-refused error fast — different code path than the
-    # stall test above; we want to confirm the start-block-failure
-    # branch in poll properly rethrows the underlying exception.
-    my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:1");
-    my $threw;
-    try {
-        $client.poll('my-prompt-id', :timeout(2e0), :interval(0.05e0));
-        CATCH {
-            default { $threw = $_ }
-        }
-    }
-    ok $threw.defined, 'poll surfaced an exception';
-    # Whatever Cro raises for a refused TCP connect — the point is
-    # the original error isn't swallowed.
-    my $msg = ($threw // Mu).message // '';
-    ok $msg.chars > 0, 'exception carries a non-empty message';
+	plan 2;
+	# Pick a port nothing is listening on. macOS / Linux give us a
+	# connection-refused error fast — different code path than the
+	# stall test above; we want to confirm the start-block-failure
+	# branch in poll properly rethrows the underlying exception.
+	my $client = ComfyUI::API::Client.new(base-url => "http://127.0.0.1:1");
+	my $threw;
+	try {
+		$client.poll('my-prompt-id', :timeout(2e0), :interval(0.05e0));
+		CATCH {
+			default { $threw = $_ }
+		}
+	}
+	ok $threw.defined, 'poll surfaced an exception';
+	# Whatever Cro raises for a refused TCP connect — the point is
+	# the original error isn't swallowed.
+	my $msg = ($threw // Mu).message // '';
+	ok $msg.chars > 0, 'exception carries a non-empty message';
 };
 
 .close for @open-conns;

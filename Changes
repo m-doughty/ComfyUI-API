@@ -2,6 +2,18 @@ Revision history for ComfyUI::API
 
 {{$NEXT}}
 
+0.3.1  2026-10-24T18:45:00+01:00
+
+    - [2026-10-24] Fix every API call leaving its connection open until the
+      process exited. Each request builds its own Cro::HTTP::Client, which
+      defaults to persistent connections, so the socket stayed cached in a
+      client that was then thrown away. Enough calls (submit, poll,
+      download, queue-status, health and the rest) used up the process's
+      open-file limit -- 256 on a stock macOS terminal -- after which new
+      requests failed with a messageless PipelineClosedBeforeHeaders. Every
+      client is now non-persistent, so each connection is closed once its
+      response is done.
+
 0.3.0  2026-10-04T22:22:55+01:00
 
     - Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19 (cpan:TIMOTIMO)

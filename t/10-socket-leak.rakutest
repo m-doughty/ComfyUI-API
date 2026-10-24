@@ -1,0 +1,298 @@
+use Test;
+use lib 'lib';
+
+use ComfyUI::API::Client;
+use ComfyUI::API::Result;
+use ComfyUI::API::Workflow;
+
+# Connection hygiene: every request must give its socket back.
+#
+# Cro::HTTP::Client.new defaults to `persistent => True`, so a client
+# that is built for one request and then dropped leaves its connection
+# cached inside an object nobody can reach any more: the socket stays
+# open until the process exits, whatever the garbage collector does.
+# Every API call leaked one descriptor on the client side (plus one on
+# the server side when both ends share a process), so enough calls --
+# and `poll` makes a call every interval -- exhausted the open-file
+# limit (256 on a stock macOS terminal) and from then on new
+# connections were accepted and immediately closed, which Cro reports
+# as a messageless PipelineClosedBeforeHeaders.
+#
+# The fixture below is a raw TCP server, not Cro, because the point is
+# to answer the way an HTTP/1.1 keep-alive server really does: a
+# complete response with a Content-Length, and no close of its own. The
+# one thing that makes it hang up is the request saying
+# `Connection: close` (RFC 9112 section 9.6), which is exactly what Cro
+# sends when the client is not persistent. A client that asked for
+# nothing of the kind -- the old, persistent one -- is therefore left
+# with a connection that only its own side can ever end, and the
+# open-connection count is the thing under test.
+
+plan 14;
+
+constant CALLS   = 20;
+constant TIMEOUT = 30;
+constant SETTLE  = 5;
+
+# Not valid UTF-8, so it can only survive as bytes.
+constant PNG = Blob.new(0x89, 0x50, 0x4E, 0x47, 0xFF, 0xFE, 0xE9, 0x00);
+
+# --- the fixture server ---------------------------------------------------
+
+my Lock $lock .= new;
+my Int  $open     = 0;
+my Int  $accepted = 0;
+my @conns;
+# How many times each /history/<id> has been asked for, so a "slow"
+# prompt can stay absent for its first few polls.
+my Int %history-hits;
+
+#| Index of the first byte after the blank line that ends a request
+#| head, or an undefined Int while the head is still incomplete. Works
+#| on the Buf because Str would fold CRLF into one grapheme.
+sub head-end(Blob:D $buf --> Int) {
+	for 0 .. $buf.bytes - 4 -> $i {
+		return $i + 4 if $buf[$i] == 13 && $buf[$i + 1] == 10
+			&& $buf[$i + 2] == 13 && $buf[$i + 3] == 10;
+	}
+	Int;
+}
+
+#| Pull one complete request off the front of $pending. Returns
+#| (method, target, wants-close) and consumes its bytes, or an empty
+#| list when the request has not fully arrived yet.
+sub take-request(Buf:D $pending is rw --> List) {
+	my $end = head-end($pending);
+	return () without $end;
+
+	my @lines = $pending.subbuf(0, $end).decode('latin-1').lines;
+	my Int  $length = 0;
+	my Bool $close  = False;
+	for @lines.skip -> $line {
+		$length = $0.Int if $line ~~ / :i ^ 'content-length:' \s* (\d+) /;
+		$close  = True   if $line ~~ / :i ^ 'connection:' \s* 'close' /;
+	}
+	return () if $pending.bytes < $end + $length;
+
+	my ($method, $target) = @lines[0].words;
+	$pending = $pending.subbuf($end + $length);
+	($method, $target, $close);
+}
+
+sub json(Str:D $text --> Blob:D) { $text.encode('utf-8') }
+
+#| What the fixture answers: (status line, content type, body).
+#| A leading /down segment makes every route fail with a 500.
+sub route(Str:D $method, Str:D $target --> List) {
+	my $path = $target.split('?').head;
+	my @parts = $path.split('/', :skip-empty);
+
+	if (@parts[0] // '') eq 'down' {
+		return ('500 Internal Server Error', 'application/json',
+			json('{"error":"down"}'));
+	}
+
+	given $path {
+		when '/prompt' {
+			('200 OK', 'application/json',
+				json('{"prompt_id":"leak-prompt","number":1,"node_errors":{}}'));
+		}
+		when m{ ^ '/history/' $<id> = (.+) $ } {
+			my Str $id = ~$<id>;
+			my Int $hits = $lock.protect({ ++%history-hits{$id} });
+			# A "slow" prompt is absent from /history for its first two
+			# polls, so poll has to loop and reuse its client.
+			if $id.starts-with('slow-') && $hits < 3 {
+				('200 OK', 'application/json', json('{}'));
+			}
+			else {
+				('200 OK', 'application/json', json(
+					'{"' ~ $id ~ '":{"outputs":{"9":{"images":'
+					~ '[{"filename":"leak.png","subfolder":"","type":"output"}]}}}}'));
+			}
+		}
+		when '/view' {
+			$target.contains('filename=missing.png')
+				?? ('404 Not Found', 'text/plain', json('not found'))
+				!! ('200 OK', 'image/png', PNG);
+		}
+		when '/queue' {
+			$method eq 'POST'
+				?? ('200 OK', 'application/json', json('{}'))
+				!! ('200 OK', 'application/json',
+					json('{"queue_running":[],"queue_pending":[]}'));
+		}
+		when '/interrupt' {
+			('200 OK', 'application/json', json('{}'));
+		}
+		when '/object_info' {
+			('200 OK', 'application/json', json(
+				'{"CheckpointLoaderSimple":{"input":{"required":'
+				~ '{"ckpt_name":[["a.safetensors","b.safetensors"],{}]}}}}'));
+		}
+		when '/system_stats' {
+			('200 OK', 'application/json', json('{"system":{"os":"posix"}}'));
+		}
+		default {
+			('404 Not Found', 'text/plain', json('unrouted'));
+		}
+	}
+}
+
+sub response(Str:D $status, Str:D $type, Blob:D $body, Bool:D $close --> Blob) {
+	my Blob $head = (
+		"HTTP/1.1 $status\r\n",
+		"Content-Type: $type\r\n",
+		"Content-Length: {$body.bytes}\r\n",
+		"Connection: {$close ?? 'close' !! 'keep-alive'}\r\n",
+		"\r\n",
+	).join.encode('latin-1');
+	$head ~ $body;
+}
+
+my $listener = IO::Socket::Async.listen('127.0.0.1', 0);
+my $tap = $listener.tap(
+	-> $conn {
+		$lock.protect({ $open++; $accepted++; @conns.push($conn) });
+		my Buf $pending .= new;
+		$conn.Supply(:bin).tap(
+			-> Blob $chunk {
+				$pending.append($chunk);
+				while take-request($pending) -> ($method, $target, $close) {
+					my ($status, $type, $body) = route($method, $target);
+					# The client may already be gone; a failed write
+					# here is not the test's business.
+					$conn.write(response($status, $type, $body, $close))
+						.then(-> $p {
+							try $p.result;
+							try $conn.close if $close;
+						});
+				}
+			},
+			# The connection supply ends when the client closes.
+			done => { $lock.protect({ $open-- }) },
+			quit => -> $err { $lock.protect({ $open-- }) },
+		);
+	},
+	quit => -> $err { },
+);
+
+my $port;
+react {
+	whenever Promise.in(TIMEOUT) { die "listener never bound" }
+	whenever $tap.socket-port { $port = $_; done }
+}
+
+LEAVE {
+	for $lock.protect({ @conns.clone }) { try .close }
+	try $tap.close;
+}
+
+#| Block, bounded, until every connection the fixture accepted has been
+#| closed by the client; returns the count still open.
+sub settle(--> Int) {
+	my Instant $deadline = now + SETTLE;
+	loop {
+		my $n = $lock.protect({ $open });
+		return $n if $n == 0 || now > $deadline;
+		sleep 0.05;
+	}
+}
+
+#| Run $call CALLS times and check what each returns. Then wait for the
+#| connections to settle and assert none are left open.
+sub no-leak(Str:D $what, &call, &check) {
+	subtest "$what leaves no connection open" => {
+		plan 3;
+		my Int $before = $lock.protect({ $accepted });
+		my @results = (^CALLS).map({ call() });
+		ok @results.grep({ check($_) }).elems == CALLS,
+			"all {CALLS} calls got the fixture's answer";
+		ok $lock.protect({ $accepted }) - $before >= 1,
+			'the calls really went over the wire';
+		is settle(), 0, 'every connection was closed by the client';
+	}
+}
+
+#| The message a call dies with, or a marker when it does not die.
+sub failure-of(&code --> Str:D) {
+	my Str $message = 'did not fail';
+	try {
+		code();
+		CATCH { default { $message = .message } }
+	}
+	$message;
+}
+
+my ComfyUI::API::Client $comfy .= new(
+	:base-url("http://127.0.0.1:$port"), :client-id<leak-test>,
+);
+my ComfyUI::API::Client $broken .= new(
+	:base-url("http://127.0.0.1:$port/down"), :client-id<leak-test>,
+);
+
+my ComfyUI::API::Workflow $workflow = ComfyUI::API::Workflow.from-hash({
+	'6' => { class_type => 'CLIPTextEncode', inputs => { text => 'hello' } },
+});
+
+my Int $n = 0;
+
+no-leak 'submit',
+	{ $comfy.submit($workflow) },
+	-> $r { $r eq 'leak-prompt' };
+
+# Answers on the first request, so the poll loop runs once.
+no-leak 'poll (answer on the first request)',
+	{ $comfy.poll("ready-{++$n}", :timeout(10e0), :interval(0.01e0)) },
+	-> $r { $r ~~ ComfyUI::API::Result && $r.image-filenames.head eq 'leak.png' };
+
+# Absent for two requests, so the poll loop goes round three times on
+# the one client it builds -- the path that most wants the connection
+# not to be cached.
+no-leak 'poll (three requests per call)',
+	{ $comfy.poll("slow-{++$n}", :timeout(10e0), :interval(0.01e0)) },
+	-> $r { $r ~~ ComfyUI::API::Result && $r.image-filenames.head eq 'leak.png' };
+
+no-leak 'submit-and-wait',
+	{ $comfy.submit-and-wait($workflow, :timeout(10e0), :interval(0.01e0)) },
+	-> $r { $r ~~ ComfyUI::API::Result };
+
+no-leak 'download',
+	{ $comfy.download('leak.png', :timeout(10e0)) },
+	-> $r { $r.elems == PNG.elems && $r[0] == 0x89 };
+
+no-leak 'download of a file that is not there',
+	{ failure-of({ $comfy.download('missing.png', :timeout(10e0)) }) },
+	-> $r { $r ne 'did not fail' };
+
+no-leak 'queue-status',
+	{ $comfy.queue-status },
+	-> %r { %r<queue_pending>:exists };
+
+no-leak 'node-info',
+	{ $comfy.node-info },
+	-> %r { %r<CheckpointLoaderSimple>:exists };
+
+no-leak 'list-checkpoints (via node-info)',
+	{ $comfy.list-checkpoints },
+	-> @r { @r.elems == 2 };
+
+no-leak 'interrupt (with and without a prompt id)',
+	{ $comfy.interrupt('leak-prompt'); $comfy.interrupt; True },
+	-> $r { $r };
+
+no-leak 'delete-from-queue',
+	{ $comfy.delete-from-queue('leak-prompt'); True },
+	-> $r { $r };
+
+no-leak 'health (reads the status and nothing else)',
+	{ $comfy.health },
+	-> $r { $r === True };
+
+no-leak 'health against a server that answers 500',
+	{ $broken.health },
+	-> $r { $r === False };
+
+no-leak 'a request that fails with an HTTP error status',
+	{ failure-of({ $broken.queue-status }) },
+	-> $r { $r ne 'did not fail' };

@@ -82,7 +82,11 @@ method submit(ComfyUI::API::Workflow:D $workflow --> Str:D) {
 		client_id => $!client-id,
 	);
 
-	my $client = Cro::HTTP::Client.new(:content-type<application/json>);
+	# Every client in this file is `:!persistent`. Each one lives for a
+	# single call, and Cro's default (persistent) caches the connection
+	# inside the client, so a dropped client leaves its socket open
+	# until the process exits.
+	my $client = Cro::HTTP::Client.new(:content-type<application/json>, :!persistent);
 	my $resp = await $client.post("$!base-url/prompt",
 		:body(to-json(%body)),
 	);
@@ -108,7 +112,12 @@ method submit(ComfyUI::API::Workflow:D $workflow --> Str:D) {
     (the orchestrator's outer CATCH) treat the failure as a regular
     error instead of a silent stall. )
 method poll(Str:D $prompt-id, Num:D :$timeout = 300e0, Num:D :$interval = 1e0 --> ComfyUI::API::Result:D) {
-	my $client = Cro::HTTP::Client.new;
+	# One client serves every iteration of the loop below, but it dies
+	# with this call: persistent, it would hand a cached connection to
+	# the next iteration and then leak it on return. Polling is at most
+	# one request per $interval, so a fresh connection each time costs
+	# nothing worth keeping.
+	my $client = Cro::HTTP::Client.new(:!persistent);
 	my Instant $deadline = now + $timeout;
 
 	loop {
@@ -184,7 +193,7 @@ method submit-and-wait(ComfyUI::API::Workflow:D $workflow, Num:D :$timeout = 300
     =end code )
 method download(Str:D $filename, Str :$subfolder = '', Str :$type = 'output',
                 Num:D :$timeout = 60e0 --> Buf:D) {
-	my $client = Cro::HTTP::Client.new;
+	my $client = Cro::HTTP::Client.new(:!persistent);
 	my $url = "$!base-url/view?filename=$filename&subfolder=$subfolder&type=$type";
 	my $fetch = start {
 		my $resp = await $client.get($url);
@@ -205,7 +214,7 @@ method download(Str:D $filename, Str :$subfolder = '', Str :$type = 'output',
 }
 
 method queue-status(--> Hash) {
-	my $client = Cro::HTTP::Client.new;
+	my $client = Cro::HTTP::Client.new(:!persistent);
 	my $resp = await $client.get("$!base-url/queue");
 	from-json(self._body-text($resp));
 }
@@ -232,7 +241,7 @@ method queue-status(--> Hash) {
     =end code )
 method interrupt(Str $prompt-id? --> Nil) {
 	try {
-		my $http = Cro::HTTP::Client.new(:content-type<application/json>);
+		my $http = Cro::HTTP::Client.new(:content-type<application/json>, :!persistent);
 		my %body = $prompt-id.defined && $prompt-id.chars
 			?? %( prompt_id => $prompt-id )
 			!! %();
@@ -265,7 +274,7 @@ method delete-from-queue(Str:D $prompt-id --> Nil) {
 	# the zero-length case (and on the unlikely Nil-coerced-to-Str).
 	return unless $prompt-id.chars;
 	try {
-		my $http = Cro::HTTP::Client.new(:content-type<application/json>);
+		my $http = Cro::HTTP::Client.new(:content-type<application/json>, :!persistent);
 		await $http.post("$!base-url/queue",
 			:body(to-json({ delete => [$prompt-id] })));
 		CATCH {
@@ -277,13 +286,13 @@ method delete-from-queue(Str:D $prompt-id --> Nil) {
 }
 
 method node-info(--> Hash) {
-	my $client = Cro::HTTP::Client.new;
+	my $client = Cro::HTTP::Client.new(:!persistent);
 	my $resp = await $client.get("$!base-url/object_info");
 	from-json(self._body-text($resp));
 }
 
 method health(Num:D :$timeout = 3e0 --> Bool:D) {
-	my $client = Cro::HTTP::Client.new;
+	my $client = Cro::HTTP::Client.new(:!persistent);
 
 	my $req = start {
 		try {

@@ -19,16 +19,43 @@ my $client = ComfyUI::API::Client.new(
 	base-url => 'http://127.0.0.1:1',  # reserved unreachable port
 );
 
+# The cancel methods log an absorbed failure to STDERR. That log is part
+# of the contract (a stuck ComfyUI must be diagnosable), so the tests
+# capture it and assert on it rather than letting it spill into the TAP
+# stream, where it would read as a failure to anyone running the suite.
+my class StderrCapture {
+	has Str $.text is rw = '';
+	method print(*@args --> True) { $!text ~= @args.join }
+	method say(*@args --> True)   { $!text ~= @args.join ~ "\n" }
+	method put(*@args --> True)   { $!text ~= @args.join ~ "\n" }
+	method flush(--> True)        { }
+}
+
+#| Run $code with STDERR redirected into memory; returns what it wrote.
+sub stderr-of(&code --> Str:D) {
+	my $capture = StderrCapture.new;
+	{
+		my $*ERR = $capture;
+		code();
+	}
+	$capture.text;
+}
+
 subtest 'interrupt absorbs network failure' => {
-	plan 1;
-	lives-ok { $client.interrupt },
+	plan 2;
+	my Str $log;
+	lives-ok { $log = stderr-of({ $client.interrupt }) },
 		'interrupt against unreachable URL returns silently';
+	like $log, /'interrupt failed'/, 'the absorbed failure is logged to STDERR';
 };
 
 subtest 'delete-from-queue absorbs network failure' => {
-	plan 1;
-	lives-ok { $client.delete-from-queue('any-id') },
+	plan 2;
+	my Str $log;
+	lives-ok { $log = stderr-of({ $client.delete-from-queue('any-id') }) },
 		'delete-from-queue against unreachable URL returns silently';
+	like $log, /'delete-from-queue(any-id) failed'/,
+		'the absorbed failure is logged to STDERR';
 };
 
 subtest 'delete-from-queue short-circuits on empty prompt-id' => {
@@ -88,8 +115,12 @@ subtest 'queued delete and targeted interrupt send exact Comfy payloads' => {
 
 subtest 'cancel methods return Nil' => {
 	plan 2;
-	is $client.interrupt, Nil,
-		'interrupt has Nil return type';
+	# The assertion runs inside the capture: the value under test is
+	# the return, and interrupt logs its absorbed failure on the way.
+	stderr-of({
+		is $client.interrupt, Nil,
+			'interrupt has Nil return type';
+	});
 	is $client.delete-from-queue(''), Nil,
 		'delete-from-queue has Nil return type';
 };
